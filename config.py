@@ -1,7 +1,7 @@
 BOT_TOKEN = "8814050557:AAHLR3QMFTBpuWIUadW9KciYpvRrsCa5yOs"
 ADMIN_ID = 7928733927
 
-AI_API_KEY = "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"
+AI_API_KEY = "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"
 AI_MODEL = "openrouter/free"
 AI_BASE_URL = "https://openrouter.ai/api/v1"
 
