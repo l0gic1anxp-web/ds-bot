@@ -1,14 +1,9 @@
-# ===== TELEGRAM =====
 BOT_TOKEN = "8814050557:AAHLR3QMFTBpuWIUadW9KciYpvRrsCa5yOs"
 ADMIN_ID = 7928733927
-
-# ===== CLOUDFLARE =====
 CF_ACCOUNT_ID = "317aab1a5a2153b6d2c9718437acdb5c"
 CF_API_TOKEN = "cfut_FaECfBv91MlHJfARDxpDaNcXCUfsmZPklDoSDTwA68d1d02a"
 CF_MODEL_TEXT = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 CF_MODEL_VISION = "@cf/meta/llama-3.2-11b-vision-instruct"
-
-# ===== НАСТРОЙКИ =====
 AUTO_SEND_DELAY = 15
 MIN_DELAY = 30
 MAX_DELAY = 180
