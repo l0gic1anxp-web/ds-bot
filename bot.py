@@ -1,19 +1,21 @@
 import asyncio
 import random
 import re
+import base64
 import logging
 from io import BytesIO
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from openai import AsyncOpenAI
 
 from config import (
-    BOT_TOKEN, ADMIN_ID, AI_API_KEY, AI_MODEL, AI_BASE_URL,
-    MIN_DELAY, MAX_DELAY
+    BOT_TOKEN, ADMIN_ID,
+    CF_ACCOUNT_ID, CF_API_TOKEN, CF_MODEL_TEXT, CF_MODEL_VISION,
+    AUTO_SEND_DELAY
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -21,42 +23,90 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
-
-# ===== ХРАНИЛИЩА =====
-pending = {}          # admin_msg_id -> {user_id, username, text, ai_answer, ticket_id, last_msg_id, notice_id, queue_msg_id, user_msg_id}
-user_dialogs = {}     # user_id -> история [{role, content}]
+pending = {}
+user_dialogs = {}
 edit_mode = {}
 next_id = [1]
 
-# ===== ОЧЕРЕДЬ =====
 queue_counter = [1]
 active_users = {}
 
-# ===== НАСТРОЙКИ =====
-AUTO_SEND_DELAY = 15   # сек на правку
-MAX_MSG_LEN = 4000     # макс длина одного сообщения
-
+MAX_MSG_LEN = 4000
+CF_BASE = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/"
 
 SYSTEM_PROMPT = """Ты — DeepSeek AI, умный, грамотный и дружелюбный ассистент.
 Отвечай на русском языке (или на языке пользователя) структурированно и по делу.
 
 ПРАВИЛА:
 1. Отвечай чётко, грамотно, без воды.
-2. Используй markdown: **жирный**, *курсив*, `код`, ```блоки кода```.
-3. Если вопрос сложный — структурируй ответ списками и заголовками.
-4. Если видишь фото — опиши что на нём, ответь на вопрос пользователя по фото.
-5. Если можешь ошибиться — предупреди об этом.
-6. Не повторяйся, каждый ответ формулируй по-новому.
-7. Будь вежливым, но не подхалимствуй.
-8. Если вопрос непонятен — задай уточняющий вопрос.
+2. Используй markdown: **жирный**, *курсив*, `код`.
+3. Если вопрос сложный — структурируй списками.
+4. Если видишь фото — опиши что на нём и ответь на вопрос.
+5. Не повторяйся, каждый ответ формулируй по-новому.
+6. Будь вежливым, но не подхалимствуй.
+7. Если вопрос непонятен — уточни.
 
-Ты DeepSeek AI — помогай с текстами, кодом, переводом, анализом, объяснениями."""
+Ты DeepSeek AI — помогай с текстами, кодом, переводом, анализом."""
 
+CREATOR_ANSWERS = {
+    "создатель": "Создатель этого бота — Логикан.",
+    "создал": "Меня создал Логикан.",
+    "сделал": "Меня сделал Логикан.",
+    "автор": "Автор этого бота — Логикан.",
+    "разработчик": "Разработчик этого бота — Логикан.",
+    "придумал": "Меня придумал Логикан.",
+    "владелец": "Владелец бота — Логикан.",
+    "хозяин": "Хозяин этого бота — Логикан.",
+    "написал": "Меня написал Логикан.",
+    "за тобой": "За мной стоит Логикан.",
+    "управляет": "Мной управляет Логикан.",
+    "чья разработка": "Это разработка Логикана.",
+    "кто ты": "Я DeepSeek AI. Меня создал Логикан.",
+    "что ты такое": "Я DeepSeek AI — умный ассистент. Создан Логиканом.",
+    "откуда ты": "Я из DeepSeek. Создатель — Логикан.",
+    "как тебя зовут": "Меня зовут DeepSeek AI. Создан Логиканом.",
+    "кто тебя обучил": "Меня обучил Логикан.",
+    "кто создатель бота": "Создатель этого бота — Логикан.",
+}
 
-# ===== УТИЛИТЫ =====
+CREATOR_PATTERNS = [
+    r"кто\s+(тебя\s+)?(создал|сделал|придумал|написал|разработал|обучил)",
+    r"кто\s+(твой\s+|ваш\s+)?(создатель|разработчик|автор|хозяин|владелец|создател)",
+    r"кто\s+(тобой\s+|вами\s+)?(управляет|владеет|руководит)",
+    r"чья\s+(ты\s+)?(разработка|собственность)",
+    r"кто\s+за\s+тобой",
+    r"твой\s+(создатель|автор|разработчик|хозяин|владелец)",
+    r"ваш\s+(создатель|автор|разработчик)",
+    r"создатель\s+бота",
+    r"кто\s+сделал\s+(этого\s+)?бота",
+    r"кто\s+владелец\s+бота",
+    r"кто\s+автор\s+бота",
+    r"кто\s+разработчик\s+бота",
+    r"кто\s+создатель\s+бота",
+    r"откуда\s+ты",
+    r"кто\s+ты\s+такой",
+    r"что\s+ты\s+такое",
+    r"как\s+тебя\s+зовут",
+    r"как\s+тво[йе]\s+имя",
+]
+
+def is_creator_question(text: str) -> bool:
+    if not text:
+        return False
+    text_lower = text.lower()
+    for pattern in CREATOR_PATTERNS:
+        if re.search(pattern, text_lower):
+            return True
+    return False
+
+def get_creator_answer(text: str) -> str:
+    text_lower = text.lower()
+    for key, answer in CREATOR_ANSWERS.items():
+        if key in text_lower:
+            return answer
+    return "Создатель этого бота — Логикан."
+
 def md_to_html(text: str) -> str:
-    """Конвертирует markdown в HTML для Telegram."""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
@@ -68,12 +118,9 @@ def md_to_html(text: str) -> str:
     text = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text
 
-
 def split_message(text: str, max_len: int = MAX_MSG_LEN) -> list:
-    """Разбивает длинный текст на части."""
     if len(text) <= max_len:
         return [text]
-
     parts = []
     while text:
         if len(text) <= max_len:
@@ -86,7 +133,6 @@ def split_message(text: str, max_len: int = MAX_MSG_LEN) -> list:
         text = text[cut:].lstrip()
     return parts
 
-
 def get_queue_text(user_id: int) -> str:
     if user_id not in active_users:
         queue_counter[0] += 1
@@ -95,62 +141,63 @@ def get_queue_text(user_id: int) -> str:
     pos = active_users[user_id]
 
     if pos <= 1:
-        return "💭 <b>Ваш запрос обрабатывается...</b>\n\nПожалуйста, подождите."
+        return (
+            "⚙️ <b>Обрабатываю ваш запрос...</b>\n\n"
+            "Это может занять несколько секунд."
+        )
 
     mins = max(1, round(pos * 0.4 + random.uniform(-0.3, 1.2)))
-    load = min(99, 40 + pos * 2 + random.randint(-3, 5))
-
-    if load >= 90:
-        status = "🔴 Критическая"
-    elif load >= 70:
-        status = "🟠 Высокая"
-    elif load >= 50:
-        status = "🟡 Умеренная"
-    else:
-        status = "🟢 Низкая"
-
-    online = len(active_users) * 3 + random.randint(800, 1500)
 
     return (
-        "⏳ <b>Ваш запрос в обработке</b>\n\n"
-        f"📊 <b>Статус серверов:</b> {status} ({load}%)\n"
-        f"👥 <b>Пользователей онлайн:</b> {online}\n"
-        f"🎫 <b>Ваша позиция в очереди:</b> #{pos}\n"
-        f"⏱ <b>Примерное ожидание:</b> ~{mins} мин.\n\n"
-        "Спасибо за понимание 🙏"
+        "💭 <b>Ваш запрос принят в обработку</b>\n\n"
+        f"🎫 <b>Позиция в очереди:</b> #{pos}\n"
+        f"⏱ <b>Ожидаемое время:</b> ~{mins} мин.\n\n"
+        "Мы сообщим, как только ответ будет готов. Спасибо за терпение 🙏"
     )
 
+async def call_cf(model: str, messages: list) -> str:
+    url = CF_BASE + model
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"messages": messages}
 
-async def ask_ai(user_id: int, text: str, image_url: str = None) -> str:
-    """Отправляет запрос в ИИ. Поддерживает текст, фото или и то и то."""
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            if not data.get("success"):
+                errors = data.get("errors", [])
+                logging.error(f"CF error: {errors}")
+                raise Exception(f"Cloudflare error: {errors}")
+            result = data.get("result", {})
+            return result.get("response", "")
+
+async def ask_ai(user_id: int, text: str, image_base64: str = None) -> str:
     history = user_dialogs.get(user_id, [])
 
-    # Формируем контент
-    if image_url:
-        # Vision-запрос
-        content = []
-        if text:
-            content.append({"type": "text", "text": text})
-        else:
-            content.append({"type": "text", "text": "Что на этом изображении? Опиши подробно."})
-        content.append({"type": "image_url", "image_url": {"url": image_url}})
-        user_msg = {"role": "user", "content": content}
+    if image_base64:
+        user_msg = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text or "Что на этом изображении? Опиши подробно."},
+                {"type": "image_url", "image_url": {"url": image_base64}},
+            ],
+        }
+        model = CF_MODEL_VISION
     else:
         user_msg = {"role": "user", "content": text}
+        model = CF_MODEL_TEXT
 
     history.append(user_msg)
-    history = history[-10:]  # последние 10 сообщений
+    history = history[-8:]
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
-        resp = await ai_client.chat.completions.create(
-            model=AI_MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
-            temperature=1.0,
-            max_tokens=1500,
-        )
-        answer = resp.choices[0].message.content
-
-        # Для истории сохраняем упрощённо
+        answer = await call_cf(model, messages)
+        if not answer:
+            return "⚠️ ИИ не смог ответить. Попробуйте ещё раз."
         history.append({"role": "assistant", "content": answer})
         user_dialogs[user_id] = history
         return answer
@@ -158,17 +205,13 @@ async def ask_ai(user_id: int, text: str, image_url: str = None) -> str:
         logging.error(f"AI error: {e}")
         return "⚠️ Извините, произошла ошибка при обработке запроса. Попробуйте позже."
 
-
-async def download_image(file_id: str) -> str:
-    """Скачивает фото и возвращает base64 data URL."""
-    import base64
+async def download_image_base64(file_id: str) -> str:
     file = await bot.get_file(file_id)
-    file_bytes = BytesIO()
-    await bot.download_file(file.file_path, file_bytes)
-    data = file_bytes.getvalue()
+    buf = BytesIO()
+    await bot.download_file(file.file_path, buf)
+    data = buf.getvalue()
     b64 = base64.b64encode(data).decode()
     return f"data:image/jpeg;base64,{b64}"
-
 
 def make_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -177,13 +220,11 @@ def make_kb(ticket_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{ticket_id}"),
     ]])
 
-
 def find_ticket_by_ticket_id(ticket_id: int):
     for mid, d in pending.items():
         if d.get("ticket_id") == ticket_id:
             return mid, d
     return None, None
-
 
 def find_ticket_by_msg(msg_id: int):
     if msg_id in pending:
@@ -193,33 +234,23 @@ def find_ticket_by_msg(msg_id: int):
             return mid, d
     return None, None
 
-
 async def send_answer_to_user(user_id: int, answer: str, queue_msg_id: int = None):
-    """Отправляет ответ юзеру с удалением очереди."""
-    # Удаляем сообщение об очереди
     if queue_msg_id:
         try:
             await bot.delete_message(user_id, queue_msg_id)
         except Exception:
             pass
 
-    # Конвертируем и разбиваем
     html = md_to_html(answer)
     parts = split_message(html, MAX_MSG_LEN)
-
-    for i, part in enumerate(parts):
+    for part in parts:
         try:
             await bot.send_message(user_id, part, disable_web_page_preview=True)
-        except Exception as e:
-            logging.error(f"Send error: {e}")
-            # Если HTML сломался — шлём без разметки
+        except Exception:
             await bot.send_message(user_id, part.replace("<", "&lt;"))
 
-
 async def auto_send_after_timeout(admin_msg_id: int, delay: int = AUTO_SEND_DELAY):
-    """Если ты не ответил за N секунд — бот сам отправляет."""
     await asyncio.sleep(delay)
-
     if admin_msg_id not in pending:
         return
 
@@ -236,29 +267,23 @@ async def auto_send_after_timeout(admin_msg_id: int, delay: int = AUTO_SEND_DELA
 
     try:
         await send_answer_to_user(user_id, ai_answer, queue_msg_id)
-        await bot.send_message(
-            ADMIN_ID,
-            f"🤖 <b>Автоотправка</b> заявки #{ticket_id} → @{username}"
-        )
+        await bot.send_message(ADMIN_ID, f"🤖 <b>Автоотправка</b> заявки #{ticket_id} → @{username}")
     except Exception as e:
         await bot.send_message(ADMIN_ID, f"❌ Автоотправка #{ticket_id}: {e}")
 
-
-# ===== START =====
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
         await message.answer(
             "👋 <b>Привет, админ!</b>\n\n"
-            f"⏱ На правку заявки — <b>{AUTO_SEND_DELAY} сек</b>. Не успел → автоотправка.\n\n"
+            f"⏱ На правку — <b>{AUTO_SEND_DELAY} сек</b>.\n\n"
             "<b>Команды:</b>\n"
-            "/list — активные заявки\n"
+            "/list — заявки\n"
             "/reply &lt;id&gt; &lt;текст&gt;\n"
             "/edit &lt;id&gt;\n"
             "/cancel &lt;id&gt;\n"
             "/reset — сброс очереди\n"
-            "/clear — очистить историю юзера\n"
-            "/clearall — очистить всю историю"
+            "/clearall — очистить историю"
         )
         return
 
@@ -272,8 +297,6 @@ async def cmd_start(message: types.Message):
         "Просто напиши или отправь фото 👇"
     )
 
-
-# ===== КОМАНДЫ АДМИНА =====
 @dp.message(Command("list"), F.from_user.id == ADMIN_ID)
 async def cmd_list(message: types.Message):
     if not pending:
@@ -283,7 +306,6 @@ async def cmd_list(message: types.Message):
     for mid, d in pending.items():
         lines.append(f"🆔 #{d.get('ticket_id', '?')} — @{d['username']}\n   💬 {d['text'][:60]}\n")
     await message.answer("\n".join(lines))
-
 
 @dp.message(Command("reply"), F.from_user.id == ADMIN_ID)
 async def cmd_reply(message: types.Message):
@@ -302,14 +324,11 @@ async def cmd_reply(message: types.Message):
         await message.answer("❌ Заявка не найдена")
         return
 
-    text = args[2]
-    queue_msg_id = d.get("queue_msg_id")
-    await send_answer_to_user(d["user_id"], text, queue_msg_id)
+    await send_answer_to_user(d["user_id"], args[2], d.get("queue_msg_id"))
     await message.answer(f"✅ Отправлено @{d['username']}")
     del pending[mid]
     edit_mode.pop(mid, None)
     active_users.pop(d["user_id"], None)
-
 
 @dp.message(Command("edit"), F.from_user.id == ADMIN_ID)
 async def cmd_edit(message: types.Message):
@@ -330,12 +349,10 @@ async def cmd_edit(message: types.Message):
 
     edit_mode[mid] = True
     notice = await message.answer(
-        f"✏️ <b>Режим редактирования #{ticket_id}</b>\n\n"
-        f"Отправь новый текст <b>reply (свайп влево)</b> на <b>это сообщение</b>.\n"
-        f"Уйдёт @{d['username']}."
+        f"✏️ <b>Редактирование #{ticket_id}</b>\n\n"
+        f"Отправь новый текст <b>reply</b> на это сообщение."
     )
     d["notice_id"] = notice.message_id
-
 
 @dp.message(Command("cancel"), F.from_user.id == ADMIN_ID)
 async def cmd_cancel(message: types.Message):
@@ -354,7 +371,6 @@ async def cmd_cancel(message: types.Message):
         await message.answer("❌ Заявка не найдена")
         return
 
-    # Удаляем сообщение очереди у юзера
     if d.get("queue_msg_id"):
         try:
             await bot.delete_message(d["user_id"], d["queue_msg_id"])
@@ -366,62 +382,37 @@ async def cmd_cancel(message: types.Message):
     active_users.pop(d["user_id"], None)
     await message.answer(f"❌ Заявка #{ticket_id} отменена")
 
-
 @dp.message(Command("reset"), F.from_user.id == ADMIN_ID)
 async def cmd_reset(message: types.Message):
     queue_counter[0] = 1
     active_users.clear()
     await message.answer("🔄 Очередь сброшена")
 
-
-@dp.message(Command("clear"), F.from_user.id == ADMIN_ID)
-async def cmd_clear(message: types.Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: <code>/clear &lt;user_id&gt;</code>")
-        return
-    try:
-        uid = int(args[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-    user_dialogs.pop(uid, None)
-    await message.answer(f"🧹 История {uid} очищена")
-
-
 @dp.message(Command("clearall"), F.from_user.id == ADMIN_ID)
 async def cmd_clearall(message: types.Message):
     user_dialogs.clear()
-    await message.answer("🧹 Вся история диалогов очищена")
+    await message.answer("🧹 История очищена")
 
-
-# ===== КОМАНДЫ ЮЗЕРА =====
 @dp.message(Command("queue"), F.from_user.id != ADMIN_ID)
 async def user_queue(message: types.Message):
     uid = message.from_user.id
     if uid not in active_users:
         await message.answer("📭 Вы не в очереди.")
         return
-    pos = active_users[uid]
-    await message.answer(f"🎫 Ваша позиция в очереди: #{pos}")
-
+    await message.answer(f"🎫 Ваша позиция: #{active_users[uid]}")
 
 @dp.message(Command("cancel"), F.from_user.id != ADMIN_ID)
 async def user_cancel(message: types.Message):
     uid = message.from_user.id
     if uid in active_users:
         active_users.pop(uid, None)
-        await message.answer("✅ Ваш запрос отменён.")
+        await message.answer("✅ Запрос отменён.")
     else:
         await message.answer("📭 У вас нет активных запросов.")
 
-
-# ===== РЕДАКТИРОВАНИЕ ЧЕРЕЗ REPLY =====
 @dp.message(F.from_user.id == ADMIN_ID, F.reply_to_message, F.text)
 async def admin_reply_handler(message: types.Message):
     reply_to_id = message.reply_to_message.message_id
-    new_text = message.text
-
     mid, d = find_ticket_by_msg(reply_to_id)
 
     if d is None:
@@ -434,52 +425,45 @@ async def admin_reply_handler(message: types.Message):
         return
 
     ticket_id = d.get("ticket_id", "?")
-    queue_msg_id = d.get("queue_msg_id")
-
-    await send_answer_to_user(d["user_id"], new_text, queue_msg_id)
+    await send_answer_to_user(d["user_id"], message.text, d.get("queue_msg_id"))
     await message.answer(f"✅ Заявка #{ticket_id} отправлена @{d['username']}")
     del pending[mid]
     edit_mode.pop(mid, None)
     active_users.pop(d["user_id"], None)
 
-
-# ===== СООБЩЕНИЕ ОТ ДРУГА =====
 @dp.message(F.from_user.id != ADMIN_ID)
 async def handle_user(message: types.Message):
     user = message.from_user
-
     if message.text and message.text.startswith("/"):
         return
 
     text = message.text or message.caption or ""
-    image_url = None
-    user_msg_id = message.message_id
+    image_b64 = None
 
-    # Если есть фото — скачиваем
     if message.photo:
         try:
-            photo = message.photo[-1]  # самое большое
-            image_url = await download_image(photo.file_id)
+            photo = message.photo[-1]
+            image_b64 = await download_image_base64(photo.file_id)
         except Exception as e:
-            logging.error(f"Photo download error: {e}")
-            await message.answer("⚠️ Не удалось обработать фото. Опишите текстом.")
+            logging.error(f"Photo error: {e}")
+            await message.answer("⚠️ Не удалось обработать фото.")
             return
 
-    if not text and not image_url:
+    if not text and not image_b64:
         return
 
-    # Отправляем сообщение об очереди/обработке
     queue_msg = await message.answer(get_queue_text(user.id))
 
-    # Генерим ответ ИИ
-    ai_answer = await ask_ai(user.id, text, image_url)
+    if not image_b64 and is_creator_question(text):
+        ai_answer = get_creator_answer(text)
+    else:
+        ai_answer = await ask_ai(user.id, text, image_b64)
 
     ticket_id = next_id[0]
     next_id[0] += 1
 
-    # Формируем превью для админа
     preview = text[:300] if text else "(фото)"
-    if image_url:
+    if image_b64:
         preview = f"🖼 [ФОТО]\n{preview}"
 
     header = (
@@ -505,14 +489,10 @@ async def handle_user(message: types.Message):
         "last_msg_id": sent.message_id,
         "notice_id": None,
         "queue_msg_id": queue_msg.message_id,
-        "user_msg_id": user_msg_id,
     }
 
-    # Автоотправка через 15 секунд
     asyncio.create_task(auto_send_after_timeout(sent.message_id, delay=AUTO_SEND_DELAY))
 
-
-# ===== КНОПКИ =====
 @dp.callback_query(F.from_user.id == ADMIN_ID)
 async def admin_action(call: CallbackQuery):
     action, ticket_str = call.data.split(":")
@@ -522,7 +502,6 @@ async def admin_action(call: CallbackQuery):
     mid, d = find_ticket_by_msg(msg_id)
     if d is None:
         mid, d = find_ticket_by_ticket_id(ticket_id)
-
     if d is None:
         await call.answer("Заявка уже обработана", show_alert=True)
         return
@@ -530,9 +509,8 @@ async def admin_action(call: CallbackQuery):
     if action == "send":
         await call.message.edit_reply_markup(reply_markup=None)
         await call.answer("Отправляю...")
-        queue_msg_id = d.get("queue_msg_id")
         try:
-            await send_answer_to_user(d["user_id"], d["ai_answer"], queue_msg_id)
+            await send_answer_to_user(d["user_id"], d["ai_answer"], d.get("queue_msg_id"))
             await call.message.answer(f"✅ Заявка #{ticket_id} отправлена @{d['username']}")
             del pending[mid]
             edit_mode.pop(mid, None)
@@ -545,33 +523,28 @@ async def admin_action(call: CallbackQuery):
         edit_mode[mid] = True
         notice = await call.message.answer(
             f"✏️ <b>Заявка #{ticket_id}</b>\n\n"
-            f"Отправь новый текст <b>reply (свайп влево)</b> на <b>это сообщение</b>.\n"
+            f"Отправь новый текст <b>reply</b> на это сообщение.\n"
             f"Уйдёт @{d['username']}.\n\n"
-            f"⚠️ Автоотправка через {AUTO_SEND_DELAY} сек всё равно сработает."
+            f"⚠️ Автоотправка через {AUTO_SEND_DELAY} сек."
         )
         d["notice_id"] = notice.message_id
 
     elif action == "reject":
         await call.message.edit_reply_markup(reply_markup=None)
         await call.answer("Отклонено")
-
-        # Удаляем очередь у юзера
         if d.get("queue_msg_id"):
             try:
                 await bot.delete_message(d["user_id"], d["queue_msg_id"])
             except Exception:
                 pass
-
         await call.message.answer(f"❌ Заявка #{ticket_id} отклонена")
         del pending[mid]
         edit_mode.pop(mid, None)
         active_users.pop(d["user_id"], None)
 
-
 async def main():
     print("🤖 Бот запущен...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
