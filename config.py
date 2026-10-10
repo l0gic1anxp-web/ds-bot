@@ -1,8 +1,8 @@
-BOT_TOKEN = "8814050557:AAHLR3QMFTBpuWIUadW9KciYpvRrsCa5yOs" 
+
+BOT_TOKEN = "8814050557:AAHLR3QMFTBpuWIUadW9KciYpvRrsCa5yOs"
 ADMIN_ID = 7928733927
-AI_API_KEY = "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"
-AI_MODEL = "openrouter/free"
+AI_API_KEY = "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"
+AI_MODEL = "google/gemini-2.0-flash-exp:free"
 AI_BASE_URL = "https://openrouter.ai/api/v1"
 MIN_DELAY = 30
 MAX_DELAY = 180
-
