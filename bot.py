@@ -744,4 +744,50 @@ async def admin_action(call: CallbackQuery):
 
     elif action == "edit":
         await call.answer("Режим редактирования")
-        edit
+        edit_mode[mid] = True
+        notice = await call.message.answer(
+            f"✏️ <b>Заявка #{ticket_id}</b>\n\n"
+            f"Отправь новый текст <b>reply</b> на это сообщение."
+        )
+        d["notice_id"] = notice.message_id
+
+    elif action == "regen":
+        await call.answer("Генерирую новый вариант...")
+        # Генерим заново
+        try:
+            new_answer = await ask_ai(d["user_id"], d["text"])
+            d["ai_answer"] = new_answer
+            header = (
+                f"🆔 <b>Заявка #{ticket_id}</b> (перегенерировано)\n\n"
+                f"👤 <b>От:</b> {d['username']}\n\n"
+                f"💬 <b>Вопрос:</b>\n{d['text'][:300]}\n\n"
+                f"🤖 <b>Новый ответ:</b>\n{md_to_html(new_answer[:2000])}"
+            )
+            sent2 = await call.message.answer(header, reply_markup=make_kb(ticket_id))
+            d["last_msg_id"] = sent2.message_id
+            # Сбрасываем таймер автоотправки
+            asyncio.create_task(auto_send_after_timeout(mid, delay=AUTO_SEND_DELAY))
+        except Exception as e:
+            await call.message.answer(f"❌ Ошибка: {e}")
+
+    elif action == "reject":
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.answer("Отклонено")
+        if d.get("queue_msg_id"):
+            try:
+                await bot.delete_message(d["user_id"], d["queue_msg_id"])
+            except Exception:
+                pass
+        await call.message.answer(f"❌ Заявка #{ticket_id} отклонена")
+        del pending[mid]
+        edit_mode.pop(mid, None)
+        active_users.pop(d["user_id"], None)
+
+
+async def main():
+    print("🤖 Бот запущен...")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
