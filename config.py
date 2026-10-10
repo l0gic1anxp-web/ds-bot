@@ -1,7 +1,14 @@
+# ===== TELEGRAM =====
 BOT_TOKEN = "8814050557:AAHLR3QMFTBpuWIUadW9KciYpvRrsCa5yOs"
 ADMIN_ID = 7928733927
-AI_API_KEY = "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"
-AI_MODEL = "google/gemma-4-26b-a4b-it:free"
-AI_BASE_URL = "https://openrouter.ai/api/v1"
+
+# ===== CLOUDFLARE =====
+CF_ACCOUNT_ID = "317aab1a5a2153b6d2c9718437acdb5c"
+CF_API_TOKEN = "cfut_FaECfBv91MlHJfARDxpDaNcXCUfsmZPklDoSDTwA68d1d02a"
+CF_MODEL_TEXT = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+CF_MODEL_VISION = "@cf/meta/llama-3.2-11b-vision-instruct"
+
+# ===== НАСТРОЙКИ =====
+AUTO_SEND_DELAY = 15
 MIN_DELAY = 30
 MAX_DELAY = 180
