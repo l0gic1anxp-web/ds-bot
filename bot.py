@@ -21,15 +21,18 @@ dp = Dispatcher()
 ai_client = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 
 # ===== ХРАНИЛИЩА =====
-pending = {}          # admin_msg_id -> {"user_id", "username", "text", "ai_answer", "notice_id"}
+pending = {}          # msg_id -> {"user_id", "username", "text", "ai_answer", "ticket_id", "last_msg_id", "notice_id"}
 user_dialogs = {}     # user_id -> история
 edit_mode = {}        # msg_id заявки -> True
 next_id = [1]
 
 # ===== ОЧЕРЕДЬ =====
-queue_counter = [1]           # следующий номер в очереди
-active_users = {}             # user_id -> его позиция в очереди
-user_queue_pos = {}           # user_id -> позиция (для /queue)
+queue_counter = [1]
+active_users = {}
+user_queue_pos = {}
+
+# ===== АВТООТПРАВКА =====
+AUTO_SEND_DELAY = 60  # секунд (1 минута)
 
 
 SYSTEM_PROMPT = """Ты — DeepSeek AI, умный и дружелюбный ассистент.
@@ -60,18 +63,14 @@ async def ask_ai(user_id: int, text: str) -> str:
 
 
 def get_queue_text(user_id: int) -> str:
-    # Первый раз — выдаём позицию
     if user_id not in active_users:
         queue_counter[0] += 1
         active_users[user_id] = queue_counter[0]
         user_queue_pos[user_id] = queue_counter[0]
 
     pos = active_users[user_id]
-
-    # Время ожидания зависит от позиции
     mins = max(1, round(pos * 0.4 + random.uniform(-0.3, 1.2)))
 
-    # Нагрузка серверов
     load = min(99, 40 + pos * 2 + random.randint(-3, 5))
     if load >= 90:
         status = "🔴 Критическая"
@@ -82,7 +81,6 @@ def get_queue_text(user_id: int) -> str:
     else:
         status = "🟢 Низкая"
 
-    # Фейковое число активных
     online = len(active_users) * 3 + random.randint(800, 1500)
 
     return (
@@ -96,7 +94,7 @@ def get_queue_text(user_id: int) -> str:
     )
 
 
-def make_kb(user_id: int, ticket_id: int) -> InlineKeyboardMarkup:
+def make_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Отправить", callback_data=f"send:{ticket_id}"),
         InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:{ticket_id}"),
@@ -104,8 +102,36 @@ def make_kb(user_id: int, ticket_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+async def auto_send_after_timeout(admin_msg_id: int, delay: int = AUTO_SEND_DELAY):
+    """Если ты не ответил за N секунд — бот сам отправляет ответ (без задержки)."""
+    await asyncio.sleep(delay)
+
+    if admin_msg_id not in pending:
+        return  # уже обработана вручную
+
+    d = pending[admin_msg_id]
+    user_id = d["user_id"]
+    username = d["username"]
+    ai_answer = d["ai_answer"]
+    ticket_id = d.get("ticket_id", "?")
+
+    # Убираем, чтобы не отправить дважды
+    del pending[admin_msg_id]
+    edit_mode.pop(admin_msg_id, None)
+    active_users.pop(user_id, None)
+
+    try:
+        await bot.send_message(user_id, ai_answer)
+        await bot.send_message(
+            ADMIN_ID,
+            f"🤖 <b>Автоотправка</b> заявки #{ticket_id} → @{username}\n"
+            f"(ты не ответил за {delay} сек, бот отправил сам)"
+        )
+    except Exception as e:
+        await bot.send_message(ADMIN_ID, f"❌ Автоотправка #{ticket_id} ошибка: {e}")
+
+
 def find_ticket_by_ticket_id(ticket_id: int):
-    """Возвращает (msg_id, data) по номеру заявки."""
     for mid, d in pending.items():
         if d.get("ticket_id") == ticket_id:
             return mid, d
@@ -113,7 +139,6 @@ def find_ticket_by_ticket_id(ticket_id: int):
 
 
 def find_ticket_by_msg(msg_id: int):
-    """Возвращает (msg_id, data) по message_id любого сообщения заявки."""
     if msg_id in pending:
         return msg_id, pending[msg_id]
     for mid, d in pending.items():
@@ -128,12 +153,13 @@ async def cmd_start(message: types.Message):
     if message.from_user.id == ADMIN_ID:
         await message.answer(
             "👋 <b>Привет, админ!</b>\n\n"
-            "Все заявки от друзей приходят сюда с кнопками.\n\n"
+            "Все заявки приходят сюда с кнопками.\n"
+            f"⏱ Если не ответишь за {AUTO_SEND_DELAY} сек — бот отправит сам.\n\n"
             "<b>Команды:</b>\n"
             "/list — активные заявки\n"
             "/reply &lt;id&gt; &lt;текст&gt; — отправить вручную\n"
             "/edit &lt;id&gt; — редактировать\n"
-            "/cancel &lt;id&gt; — отменить заявку\n"
+            "/cancel &lt;id&gt; — отменить\n"
             "/reset — сбросить очередь"
         )
         return
@@ -184,12 +210,12 @@ async def cmd_reply(message: types.Message):
 
     text = args[2]
     await message.answer(f"⏳ Отправляю @{d['username']}...")
-    await asyncio.sleep(random.randint(MIN_DELAY, MAX_DELAY))
 
     try:
         await bot.send_message(d["user_id"], text)
         await message.answer(f"✅ Отправлено @{d['username']}")
         del pending[mid]
+        edit_mode.pop(mid, None)
         active_users.pop(d["user_id"], None)
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
@@ -251,7 +277,7 @@ async def cmd_reset(message: types.Message):
     queue_counter[0] = 1
     active_users.clear()
     user_queue_pos.clear()
-    await message.answer("🔄 Очередь сброшена. Следующий юзер получит позицию #2")
+    await message.answer("🔄 Очередь сброшена")
 
 
 # ===== /queue ДЛЯ ЮЗЕРА =====
@@ -261,7 +287,7 @@ async def user_queue(message: types.Message):
     if uid not in active_users:
         await message.answer(
             "📭 Вы не в очереди.\n\n"
-            "Просто напишите мне вопрос — и я поставлю вас в очередь."
+            "Напишите вопрос — и я поставлю вас в очередь."
         )
         return
 
@@ -307,7 +333,6 @@ async def admin_reply_handler(message: types.Message):
 
     ticket_id = d.get("ticket_id", "?")
     await message.answer(f"⏳ Отправляю @{d['username']}...")
-    await asyncio.sleep(random.randint(MIN_DELAY, MAX_DELAY))
 
     try:
         await bot.send_message(d["user_id"], new_text)
@@ -324,16 +349,13 @@ async def admin_reply_handler(message: types.Message):
 async def handle_user(message: types.Message):
     user = message.from_user
 
-    # Игнорируем команды
     if message.text and message.text.startswith("/"):
         return
 
     text = message.text or "(не текст)"
 
-    # Показываем очередь
     await message.answer(get_queue_text(user.id))
 
-    # Генерим ответ через ИИ
     ai_answer = await ask_ai(user.id, text)
 
     ticket_id = next_id[0]
@@ -343,13 +365,13 @@ async def handle_user(message: types.Message):
         f"🆔 <b>Заявка #{ticket_id}</b>\n\n"
         f"👤 <b>От:</b> {user.full_name} (@{user.username or 'без_ника'})\n"
         f"🆔 <code>{user.id}</code>\n"
-        f"🎫 <b>Позиция в очереди:</b> #{active_users.get(user.id, '?')}\n\n"
+        f"🎫 <b>Позиция:</b> #{active_users.get(user.id, '?')}\n\n"
         f"💬 <b>Вопрос:</b>\n{text}\n\n"
         f"🤖 <b>Ответ ИИ:</b>\n{ai_answer}"
     )
 
     sent = await bot.send_message(
-        ADMIN_ID, header, reply_markup=make_kb(user.id, ticket_id),
+        ADMIN_ID, header, reply_markup=make_kb(ticket_id),
         disable_web_page_preview=True
     )
 
@@ -362,6 +384,9 @@ async def handle_user(message: types.Message):
         "last_msg_id": sent.message_id,
         "notice_id": None,
     }
+
+    # Автоотправка через 1 минуту, если не ответишь
+    asyncio.create_task(auto_send_after_timeout(sent.message_id, delay=AUTO_SEND_DELAY))
 
 
 # ===== КНОПКИ =====
@@ -382,11 +407,11 @@ async def admin_action(call: CallbackQuery):
     if action == "send":
         await call.message.edit_reply_markup(reply_markup=None)
         await call.answer("Отправляю...")
-        await asyncio.sleep(random.randint(MIN_DELAY, MAX_DELAY))
         try:
             await bot.send_message(d["user_id"], d["ai_answer"])
             await call.message.answer(f"✅ Заявка #{ticket_id} отправлена @{d['username']}")
             del pending[mid]
+            edit_mode.pop(mid, None)
             active_users.pop(d["user_id"], None)
         except Exception as e:
             await call.message.answer(f"❌ Ошибка: {e}")
@@ -397,7 +422,9 @@ async def admin_action(call: CallbackQuery):
         notice = await call.message.answer(
             f"✏️ <b>Заявка #{ticket_id}</b>\n\n"
             f"Отправь новый текст <b>reply (свайп влево)</b> на <b>это сообщение</b>.\n"
-            f"Уйдёт @{d['username']}."
+            f"Уйдёт @{d['username']}.\n\n"
+            f"⚠️ Автоотправка через {AUTO_SEND_DELAY} сек всё равно сработает, "
+            f"если не ответишь."
         )
         d["notice_id"] = notice.message_id
 
